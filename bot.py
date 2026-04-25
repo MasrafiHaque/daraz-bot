@@ -49,23 +49,35 @@ def save_cfg(cfg):
 def is_admin(update: Update):
     return update.effective_user.id == ADMIN_ID
 
+# ── FIX 3: entities সংরক্ষণ — bold/underline/quote হুবহু থাকবে ──
+
 def entities_to_list(entities):
     if not entities:
         return []
-    return [{
-        "type":   e.type.value if hasattr(e.type, "value") else str(e.type),
-        "offset": e.offset,
-        "length": e.length,
-        "url":    e.url or ""
-    } for e in entities]
+    result = []
+    for e in entities:
+        entry = {
+            "type":   e.type.value if hasattr(e.type, "value") else str(e.type),
+            "offset": e.offset,
+            "length": e.length,
+        }
+        if e.url:
+            entry["url"] = e.url
+        result.append(entry)
+    return result
 
 def list_to_entities(entity_list):
     if not entity_list:
         return None
-    return [MessageEntity(
-        type=e["type"], offset=e["offset"],
-        length=e["length"], url=e.get("url") or None
-    ) for e in entity_list]
+    result = []
+    for e in entity_list:
+        result.append(MessageEntity(
+            type=e["type"],
+            offset=e["offset"],
+            length=e["length"],
+            url=e.get("url") or None
+        ))
+    return result
 
 def extract_post_from_msg(msg):
     tz = pytz.timezone(TIMEZONE)
@@ -76,7 +88,7 @@ def extract_post_from_msg(msg):
             "entities":   entities_to_list(msg.caption_entities),
             "created_at": datetime.now(tz).strftime("%Y-%m-%d %H:%M")
         }
-    elif msg.text:
+    elif msg.text and not msg.text.startswith("/"):
         return {
             "photo_id":   None,
             "caption":    msg.text,
@@ -85,47 +97,63 @@ def extract_post_from_msg(msg):
         }
     return None
 
-def get_next_post_id(posts, cfg):
-    """Currently queued next post er id return koro"""
+# ── FIX 2: add/delete এর পরেও index ঠিক থাকবে ──────────────────
+# পরের post কোনটা হবে সেটা id দিয়ে track করি, index দিয়ে না।
+# এতে নতুন post add বা যেকোনো post delete করলেও
+# পরের post একই থাকবে।
+
+def get_current_next_id(posts, cfg):
+    """এই মুহূর্তে next post এর id কত"""
     if not posts:
         return None
     idx = cfg["post_index"] % len(posts)
     return posts[idx]["id"]
 
-def fix_index_after_change(cfg, posts, old_next_id):
-    """
-    Add/delete er pore index thik koro.
-    old_next_id = age je post next hoto tar id.
-    Sei id ekhono thakle same post e thako.
-    Delete hoye gele same slot e thako (circular).
-    """
+def restore_index_by_id(posts, cfg, target_id):
+    """target_id এর post কে next বানাই"""
     if not posts:
         cfg["post_index"] = 0
         return
-    total = len(posts)
     for i, p in enumerate(posts):
-        if p["id"] == old_next_id:
+        if p["id"] == target_id:
             cfg["post_index"] = i
             return
-    # deleted — same position e thako
-    old_idx = cfg.get("post_index", 0)
-    cfg["post_index"] = old_idx % total
+    # target_id delete হয়ে গেলে — same position এ থাকি
+    old = cfg.get("post_index", 0)
+    cfg["post_index"] = old % len(posts)
 
-def append_post_safe(post, posts, cfg):
+def add_post_preserve_index(new_post, posts, cfg):
     """
-    Post add koro index preserve kore.
-    Returns: (updated_posts, new_id)
+    Post list এ add করি, কিন্তু next post একই থাকে।
+    মানে নতুন post add করলে চলমান sequence নষ্ট হবে না।
     """
-    old_next_id = get_next_post_id(posts, cfg)
-    new_id = (posts[-1]["id"] + 1) if posts else 1
-    post["id"] = new_id
-    posts.append(post)
+    next_id = get_current_next_id(posts, cfg)
+    new_id  = (max(p["id"] for p in posts) + 1) if posts else 1
+    new_post["id"] = new_id
+    posts.append(new_post)
     save_posts(posts)
-    if old_next_id is not None:
-        fix_index_after_change(cfg, posts, old_next_id)
-    # if no posts existed before, index stays 0 (first post)
+    if next_id is not None:
+        restore_index_by_id(posts, cfg, next_id)
     save_cfg(cfg)
-    return posts, new_id
+    return new_id
+
+def delete_post_preserve_index(del_id, posts, cfg):
+    """
+    Post delete করি, কিন্তু next post একই থাকে
+    (delete হয়ে গেলে তার পরেরটা next হয়)।
+    """
+    next_id = get_current_next_id(posts, cfg)
+    posts   = [p for p in posts if p["id"] != del_id]
+    save_posts(posts)
+    if next_id == del_id:
+        # deleted post ছিল next — এর পরেরটা next হবে
+        # restore_index_by_id match করবে না, তাই same slot রাখি
+        old = cfg.get("post_index", 0)
+        cfg["post_index"] = old % len(posts) if posts else 0
+    else:
+        restore_index_by_id(posts, cfg, next_id)
+    save_cfg(cfg)
+    return posts
 
 # ─────────────────────────── scheduler ──────────────────────────
 
@@ -137,15 +165,11 @@ async def send_next_post(app):
     if not posts or not cfg.get("active"):
         return
 
-    total    = len(posts)
-    idx      = cfg["post_index"] % total
-    post     = posts[idx]
-    next_idx = (idx + 1) % total
-    cfg["post_index"] = next_idx
+    total = len(posts)
+    idx   = cfg["post_index"] % total
+    post  = posts[idx]
 
-    if next_idx == 0:
-        logger.info("All posts cycled — restarting from #1")
-
+    cfg["post_index"] = (idx + 1) % total
     save_cfg(cfg)
 
     caption  = post.get("caption", "")
@@ -166,7 +190,7 @@ async def send_next_post(app):
                 entities=entities,
                 disable_web_page_preview=False
             )
-        logger.info(f"Sent post {idx + 1}/{total}")
+        logger.info(f"Sent post #{post['id']} ({idx+1}/{total})")
     except Exception as e:
         logger.error(f"Send error: {e}")
 
@@ -178,30 +202,31 @@ def restart_scheduler(app, hours):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        return await update.message.reply_text("Access denied.")
+        return await update.message.reply_text("⛔ Access denied.")
     cfg   = load_cfg()
     posts = load_posts()
     await update.message.reply_text(
-        "<b>Daraz Affiliate Bot</b>\n\n"
-        f"Total Posts: <b>{len(posts)}</b>\n"
-        f"Interval: <b>{cfg['interval_hours']}h</b>\n"
-        f"Status: <b>{'Active' if cfg['active'] else 'Paused'}</b>\n"
-        "Cycle: After last post, restarts from #1\n\n"
-        "<b>Add Posts:</b>\n"
-        "- Send photo (with or without caption)\n"
-        "- Send text\n"
-        "- Forward one or multiple posts\n\n"
-        "<b>Commands:</b>\n"
-        "/schedule — view all scheduled posts\n"
-        "/schedule cancel — cancel and reset to #1\n"
-        "/delete — remove a post\n"
-        "/interval 2 — set interval (hours)\n"
-        "/pause — pause posting\n"
-        "/resume — resume posting\n"
-        "/sendnow — send immediately\n"
-        "/status — current status",
+        "🤖 <b>Daraz Affiliate Bot</b>\n\n"
+        f"📦 মোট Post: <b>{len(posts)}</b>\n"
+        f"⏱️ Interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
+        f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "<b>📤 Post যোগ করতে:</b>\n"
+        "• ছবি পাঠান (caption সহ বা ছাড়া)\n"
+        "• শুধু text পাঠান\n"
+        "• একাধিক post <b>forward</b> করুন — সব একসাথে add হবে\n\n"
+        "<b>⚙️ কমান্ড:</b>\n"
+        "/schedule — সব post দেখুন ও পরের post জানুন\n"
+        "/delete — post মুছুন\n"
+        "/interval 2 — interval সেট করুন\n"
+        "/pause — bot বন্ধ করুন\n"
+        "/resume — bot চালু করুন\n"
+        "/sendnow — এখনই post পাঠান\n"
+        "/status — bot এর অবস্থা",
         parse_mode="HTML"
     )
+
+# ── FIX 1: Forward করে একাধিক post একসাথে add ──────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -211,37 +236,47 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not post:
         return
 
-    # Forwarded: directly add, preserve index
-    if msg.forward_origin or msg.forward_from or msg.forward_from_chat:
+    is_forwarded = bool(
+        msg.forward_origin or
+        msg.forward_from or
+        msg.forward_from_chat or
+        msg.forward_sender_name
+    )
+
+    if is_forwarded:
+        # Forward করা post সরাসরি add হয়, confirmation ছাড়া
+        # Index preserve হয়
         posts = load_posts()
         cfg   = load_cfg()
-        posts, new_id = append_post_safe(post, posts, cfg)
+        new_id = add_post_preserve_index(post, posts, cfg)
 
-        icon    = "IMG" if post["photo_id"] else "TXT"
-        preview = (post["caption"] or "")[:40].replace("\n", " ")
-        suffix  = "..." if len(post["caption"] or "") > 40 else ""
+        icon    = "🖼️" if post["photo_id"] else "📝"
+        preview = (post["caption"] or "")[:50].replace("\n", " ")
         await msg.reply_text(
-            f"Added [{icon}] #{new_id} | Total: {len(posts)}\n{preview}{suffix}"
+            f"✅ {icon} Post <b>#{new_id}</b> added!\n"
+            f"📦 মোট: {len(posts) + 1 if new_id > len(posts) else len(load_posts())}\n"
+            f"<i>{preview}{'…' if len(post['caption'] or '') > 50 else ''}</i>\n\n"
+            f"💡 একাধিক post forward করলে সব add হবে।",
+            parse_mode="HTML"
         )
         return
 
-    # Normal message: ask confirmation
+    # Normal message — preview দেখাই, confirmation নিই
     ctx.bot_data["pending"] = post
-    icon = "Photo" if post["photo_id"] else "Text"
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Add to schedule", callback_data="save"),
-        InlineKeyboardButton("Discard",         callback_data="discard")
+        InlineKeyboardButton("✅ Schedule করুন", callback_data="save"),
+        InlineKeyboardButton("❌ বাদ দিন",       callback_data="discard")
     ]])
 
     if post["photo_id"]:
         await msg.reply_photo(
             photo=post["photo_id"],
-            caption=f"Preview [{icon}] — Add to schedule?",
+            caption="📋 Preview — হুবহু এভাবেই channel এ যাবে\n\nSchedule করবেন?",
             reply_markup=kb
         )
     else:
         await msg.reply_text(
-            f"Preview:\n\n{post['caption']}\n\n---\nAdd to schedule?",
+            "📋 Preview — হুবহু এভাবেই channel এ যাবে\n\nSchedule করবেন?",
             reply_markup=kb
         )
 
@@ -252,52 +287,50 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "discard":
         ctx.bot_data.pop("pending", None)
-        await query.edit_message_text("Discarded.")
+        try:
+            await query.edit_message_caption(caption="❌ বাতিল।")
+        except:
+            await query.edit_message_text("❌ বাতিল।")
         return
 
     if data == "save":
         pending = ctx.bot_data.pop("pending", None)
         if not pending:
-            await query.edit_message_text("Error — please send again.")
+            await query.edit_message_text("❌ সমস্যা হয়েছে, আবার পাঠান।")
             return
 
-        posts = load_posts()
-        cfg   = load_cfg()
-        posts, new_id = append_post_safe(pending, posts, cfg)
+        posts  = load_posts()
+        cfg    = load_cfg()
+        new_id = add_post_preserve_index(pending, posts, cfg)
+        posts  = load_posts()  # reload after save
 
-        await query.edit_message_text(
-            f"Added #{new_id} | Total: {len(posts)}"
+        msg = (
+            f"✅ Post <b>#{new_id}</b> schedule এ যোগ হয়েছে!\n"
+            f"📦 মোট post: {len(posts)}\n"
+            f"⏱️ পরবর্তী post: {cfg['interval_hours']} ঘন্টা পর"
         )
+        try:
+            await query.edit_message_caption(caption=msg, parse_mode="HTML")
+        except:
+            await query.edit_message_text(msg, parse_mode="HTML")
         return
 
     if data.startswith("del|"):
         del_id = int(data.split("|")[1])
         posts  = load_posts()
         cfg    = load_cfg()
-
-        # Save next post id BEFORE deleting
-        old_next_id = get_next_post_id(posts, cfg)
-
-        posts = [p for p in posts if p["id"] != del_id]
-        save_posts(posts)
-
-        fix_index_after_change(cfg, posts, old_next_id)
-        save_cfg(cfg)
-
+        posts  = delete_post_preserve_index(del_id, posts, cfg)
         await query.edit_message_text(
-            f"Deleted #{del_id} | Remaining: {len(posts)}"
+            f"🗑️ Post <b>#{del_id}</b> মুছে ফেলা হয়েছে।\n"
+            f"📦 বাকি post: {len(posts)}",
+            parse_mode="HTML"
         )
 
 async def schedule_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /schedule       — list all posts
-    /schedule all   — same
-    /schedule cancel — pause + reset index to 0
-    """
     if not is_admin(update):
         return
 
-    sub = (ctx.args[0].lower() if ctx.args else "all")
+    sub = (ctx.args[0].lower() if ctx.args else "list")
 
     if sub == "cancel":
         cfg = load_cfg()
@@ -305,17 +338,13 @@ async def schedule_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cfg["post_index"] = 0
         save_cfg(cfg)
         await update.message.reply_text(
-            "Schedule cancelled. Index reset to #1.\n"
-            "Use /resume to start again."
+            "⏸️ Schedule বাতিল। Index #1 এ reset।\n/resume দিয়ে আবার চালু করুন।"
         )
         return
 
-    # list
     posts = load_posts()
     if not posts:
-        return await update.message.reply_text(
-            "No posts yet. Send a photo or text to add."
-        )
+        return await update.message.reply_text("📭 কোনো post নেই।")
 
     cfg     = load_cfg()
     current = cfg["post_index"] % len(posts)
@@ -325,21 +354,20 @@ async def schedule_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         next_run = jobs[0].next_run_time.strftime("%d %b, %I:%M %p")
 
     lines = [
-        f"<b>Scheduled Posts ({len(posts)})</b>",
-        f"Next post at: <b>{next_run}</b>\n"
+        f"📋 <b>Scheduled Posts ({len(posts)})</b>",
+        f"🕐 পরবর্তী post: <b>{next_run}</b>\n"
     ]
     for i, p in enumerate(posts):
-        marker  = ">" if i == current else " "
+        marker  = "▶️" if i == current else "   "
         preview = (p.get("caption") or "")[:50].replace("\n", " ")
-        suffix  = "..." if len(p.get("caption", "")) > 50 else ""
-        icon    = "[IMG]" if p.get("photo_id") else "[TXT]"
+        suffix  = "…" if len(p.get("caption", "")) > 50 else ""
+        icon    = "🖼️" if p.get("photo_id") else "📝"
         lines.append(
-            f"{marker} {icon} <b>#{p['id']}</b> {preview}{suffix}\n"
-            f"    {p.get('created_at', '')}"
+            f"{marker}{icon} <b>#{p['id']}</b> {preview}{suffix}\n"
+            f"      🕐 {p.get('created_at', '')}"
         )
 
-    lines.append("\nCycles from #1 after last post.")
-    lines.append("Use /schedule cancel to reset index.")
+    lines.append("\n🔁 শেষ post এর পর আবার #1 থেকে শুরু।")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def delete_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -347,19 +375,19 @@ async def delete_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     posts = load_posts()
     if not posts:
-        return await update.message.reply_text("No posts.")
+        return await update.message.reply_text("📭 কোনো post নেই।")
 
     buttons = []
     for p in posts:
         preview = (p.get("caption") or "")[:30].replace("\n", " ")
-        icon    = "[IMG]" if p.get("photo_id") else "[TXT]"
+        icon    = "🖼️" if p.get("photo_id") else "📝"
         buttons.append([InlineKeyboardButton(
-            f"{icon} #{p['id']} {preview}",
+            f"{icon} #{p['id']} — {preview}…",
             callback_data=f"del|{p['id']}"
         )])
-    buttons.append([InlineKeyboardButton("Cancel", callback_data="discard")])
+    buttons.append([InlineKeyboardButton("❌ বাতিল", callback_data="discard")])
     await update.message.reply_text(
-        "<b>Select post to delete:</b>",
+        "🗑️ <b>কোন post মুছবেন?</b>\n<i>(index preserve হবে)</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -370,8 +398,8 @@ async def set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         cfg = load_cfg()
         return await update.message.reply_text(
-            f"Current interval: <b>{cfg['interval_hours']}h</b>\n"
-            f"Change with: <code>/interval 2</code>",
+            f"⏱️ বর্তমান interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
+            f"পরিবর্তন করতে: <code>/interval 2</code>",
             parse_mode="HTML"
         )
     try:
@@ -379,14 +407,14 @@ async def set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if hours < 0.1:
             raise ValueError
     except Exception:
-        return await update.message.reply_text("Invalid. Example: /interval 2")
+        return await update.message.reply_text("❌ সঠিক সংখ্যা দিন। যেমন: /interval 2")
 
     cfg = load_cfg()
     cfg["interval_hours"] = hours
     save_cfg(cfg)
     restart_scheduler(ctx.application, hours)
     await update.message.reply_text(
-        f"Interval set to <b>{hours}h</b>",
+        f"✅ Interval <b>{hours} ঘন্টা</b> সেট হয়েছে!",
         parse_mode="HTML"
     )
 
@@ -396,7 +424,7 @@ async def pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_cfg()
     cfg["active"] = False
     save_cfg(cfg)
-    await update.message.reply_text("Bot paused.")
+    await update.message.reply_text("⏸️ Bot pause — post যাবে না।")
 
 async def resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -404,16 +432,16 @@ async def resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_cfg()
     cfg["active"] = True
     save_cfg(cfg)
-    await update.message.reply_text("Bot resumed.")
+    await update.message.reply_text("▶️ Bot চালু — post যেতে থাকবে।")
 
 async def send_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     if not load_posts():
-        return await update.message.reply_text("No posts.")
-    await update.message.reply_text("Sending now...")
+        return await update.message.reply_text("📭 কোনো post নেই।")
+    await update.message.reply_text("📤 পাঠানো হচ্ছে...")
     await send_next_post(ctx.application)
-    await update.message.reply_text("Done!")
+    await update.message.reply_text("✅ Post channel এ গেছে!")
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -424,15 +452,16 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     next_run = "N/A"
     if jobs and jobs[0].next_run_time:
         next_run = jobs[0].next_run_time.strftime("%d %b, %I:%M %p")
-    current_idx   = cfg["post_index"] % len(posts) if posts else 0
+    current_idx = cfg["post_index"] % len(posts) if posts else 0
+    next_post   = posts[current_idx]["id"] if posts else "-"
     await update.message.reply_text(
-        "<b>Bot Status</b>\n\n"
-        f"Total Posts: <b>{len(posts)}</b>\n"
-        f"Next Post: <b>#{current_idx + 1}</b> / {len(posts)}\n"
-        f"Interval: <b>{cfg['interval_hours']}h</b>\n"
-        f"Status: <b>{'Active' if cfg['active'] else 'Paused'}</b>\n"
-        f"Next run: <b>{next_run}</b>\n"
-        f"Channel: <code>{CHANNEL_ID}</code>",
+        "📊 <b>Bot Status</b>\n\n"
+        f"📦 মোট Post: <b>{len(posts)}</b>\n"
+        f"▶️ পরের Post: <b>#{next_post}</b>\n"
+        f"⏱️ Interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
+        f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n"
+        f"🕐 পরবর্তী run: <b>{next_run}</b>\n"
+        f"📢 Channel: <code>{CHANNEL_ID}</code>",
         parse_mode="HTML"
     )
 
