@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -31,7 +31,7 @@ def save_posts(posts):
         json.dump(posts, f, ensure_ascii=False, indent=2)
 
 def load_cfg():
-    default = {"interval_hours": 2, "active": True, "post_index": 0}
+    default = {"interval_hours": 1, "active": True, "post_index": 0}
     if os.path.exists(CFG_FILE):
         with open(CFG_FILE, "r") as f:
             cfg = json.load(f)
@@ -47,6 +47,34 @@ def save_cfg(cfg):
 def is_admin(update: Update):
     return update.effective_user.id == ADMIN_ID
 
+def entities_to_list(entities):
+    """MessageEntity list কে JSON-serializable list এ convert করি"""
+    if not entities:
+        return []
+    result = []
+    for e in entities:
+        result.append({
+            "type":   e.type.value if hasattr(e.type, 'value') else str(e.type),
+            "offset": e.offset,
+            "length": e.length,
+            "url":    e.url or ""
+        })
+    return result
+
+def list_to_entities(entity_list):
+    """JSON list কে MessageEntity list এ convert করি"""
+    if not entity_list:
+        return None
+    result = []
+    for e in entity_list:
+        result.append(MessageEntity(
+            type=e["type"],
+            offset=e["offset"],
+            length=e["length"],
+            url=e.get("url") or None
+        ))
+    return result
+
 scheduler = AsyncIOScheduler(timezone=pytz.timezone(TIMEZONE))
 
 async def send_next_post(app):
@@ -54,23 +82,37 @@ async def send_next_post(app):
     posts = load_posts()
     if not posts or not cfg.get("active"):
         return
-    idx  = cfg["post_index"] % len(posts)
-    post = posts[idx]
-    cfg["post_index"] = (idx + 1) % len(posts)
+
+    total = len(posts)
+    idx   = cfg["post_index"] % total
+    post  = posts[idx]
+
+    # পরের index সেট করো — শেষ হলে আবার 0 থেকে শুরু
+    next_idx = (idx + 1) % total
+    cfg["post_index"] = next_idx
+
+    # Cycle শেষ হলে log করো
+    if next_idx == 0:
+        logger.info("✅ সব post শেষ — আবার প্রথম থেকে শুরু হবে।")
+
     save_cfg(cfg)
+
+    caption  = post.get("caption", "")
+    entities = list_to_entities(post.get("entities", []))
+
     try:
         if post.get("photo_id"):
             await app.bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=post["photo_id"],
-                caption=post.get("caption", ""),
-                parse_mode="HTML"
+                caption=caption,
+                caption_entities=entities
             )
         else:
             await app.bot.send_message(
                 chat_id=CHANNEL_ID,
-                text=post.get("caption", ""),
-                parse_mode="HTML",
+                text=caption,
+                entities=entities,
                 disable_web_page_preview=False
             )
         logger.info(f"Post {idx+1} sent.")
@@ -90,11 +132,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👋 <b>Daraz Affiliate Bot</b>\n\n"
         f"📦 মোট Post: <b>{len(posts)}</b>\n"
         f"⏱️ Interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
-        f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n\n"
+        f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n"
+        f"🔁 Cycle: সব post শেষ হলে আবার #1 থেকে শুরু\n\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"<b>📤 Post যোগ করতে:</b>\n"
         f"ছবি পাঠান (caption সহ) অথবা শুধু text পাঠান।\n"
-        f"Bot preview দেখাবে → ✅ বা ❌ চাপুন।\n\n"
+        f"আপনার bold/underline/quote সব হুবহু থাকবে ✅\n\n"
         f"<b>⚙️ কমান্ড:</b>\n"
         f"/list — সব post দেখুন\n"
         f"/delete — post মুছুন\n"
@@ -106,10 +149,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-# ── Message Handler ─────────────────────────────────────────
-# Bug fix: photo_id কে callback_data তে রাখা যায় না (64 byte limit)
-# তাই pending post টা context.bot_data তে রাখছি
-
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -118,9 +157,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg.photo:
         photo_id = msg.photo[-1].file_id
         caption  = msg.caption or ""
+        # Caption entities সংরক্ষণ — bold/underline/quote সব থাকবে
+        entities = entities_to_list(msg.caption_entities)
 
-        # pending post সংরক্ষণ করি bot_data তে
-        ctx.bot_data["pending"] = {"photo_id": photo_id, "caption": caption}
+        ctx.bot_data["pending"] = {
+            "photo_id": photo_id,
+            "caption":  caption,
+            "entities": entities
+        }
 
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Schedule করুন", callback_data="save"),
@@ -128,26 +172,30 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]])
         await msg.reply_photo(
             photo=photo_id,
-            caption=f"<b>📋 Preview:</b>\n\n{caption or '(caption নেই)'}\n\n<i>Channel এ schedule করবেন?</i>",
-            parse_mode="HTML",
+            caption=f"📋 Preview — হুবহু এভাবেই channel এ যাবে ✅\n\nSchedule করবেন?",
             reply_markup=kb
         )
 
     elif msg.text and not msg.text.startswith("/"):
-        text = msg.text
-        ctx.bot_data["pending"] = {"photo_id": None, "caption": text}
+        text     = msg.text
+        # Text entities সংরক্ষণ
+        entities = entities_to_list(msg.entities)
+
+        ctx.bot_data["pending"] = {
+            "photo_id": None,
+            "caption":  text,
+            "entities": entities
+        }
 
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Schedule করুন", callback_data="save"),
             InlineKeyboardButton("❌ বাদ দিন",       callback_data="cancel")
         ]])
         await msg.reply_text(
-            f"<b>📋 Preview:</b>\n\n{text}\n\n<i>Channel এ schedule করবেন?</i>",
-            parse_mode="HTML",
+            "📋 Preview — হুবহু এভাবেই channel এ যাবে ✅\n\nSchedule করবেন?",
             reply_markup=kb
         )
 
-# ── Callback Handler ────────────────────────────────────────
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -155,10 +203,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel":
         ctx.bot_data.pop("pending", None)
-        try:
-            await query.edit_message_caption(caption="❌ বাতিল করা হয়েছে।")
-        except:
-            await query.edit_message_text("❌ বাতিল করা হয়েছে।")
+        await query.edit_message_text("❌ বাতিল করা হয়েছে।")
         return
 
     if data == "save":
@@ -172,21 +217,18 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "id":         len(posts) + 1,
             "photo_id":   pending["photo_id"],
             "caption":    pending["caption"],
+            "entities":   pending.get("entities", []),
             "created_at": datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
         }
         posts.append(new_post)
         save_posts(posts)
 
         cfg = load_cfg()
-        msg = (
-            f"✅ <b>Post #{new_post['id']} সংরক্ষিত!</b>\n"
+        await query.edit_message_text(
+            f"✅ Post #{new_post['id']} সংরক্ষিত!\n"
             f"📦 মোট post: {len(posts)}\n"
-            f"⏱️ পরবর্তী post যাবে <b>{cfg['interval_hours']} ঘন্টা</b> পর।"
+            f"⏱️ পরবর্তী post যাবে {cfg['interval_hours']} ঘন্টা পর।"
         )
-        try:
-            await query.edit_message_caption(caption=msg, parse_mode="HTML")
-        except:
-            await query.edit_message_text(msg, parse_mode="HTML")
 
     elif data.startswith("del|"):
         del_id = int(data.split("|")[1])
@@ -256,7 +298,10 @@ async def set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg["interval_hours"] = hours
     save_cfg(cfg)
     restart_scheduler(ctx.application, hours)
-    await update.message.reply_text(f"✅ Interval <b>{hours} ঘন্টা</b> সেট হয়েছে!", parse_mode="HTML")
+    await update.message.reply_text(
+        f"✅ Interval <b>{hours} ঘন্টা</b> সেট হয়েছে!",
+        parse_mode="HTML"
+    )
 
 async def pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
@@ -284,13 +329,16 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     next_run = "N/A"
     if jobs and jobs[0].next_run_time:
         next_run = jobs[0].next_run_time.strftime("%d %b, %I:%M %p")
+    current_idx = cfg["post_index"] % len(posts) if posts else 0
     await update.message.reply_text(
         f"📊 <b>Bot Status</b>\n\n"
         f"📦 মোট Post: <b>{len(posts)}</b>\n"
+        f"▶️ পরবর্তী Post: <b>#{current_idx + 1}</b> / {len(posts)}\n"
         f"⏱️ Interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
         f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n"
-        f"🕐 পরবর্তী Post: <b>{next_run}</b>\n"
-        f"📢 Channel: <code>{CHANNEL_ID}</code>",
+        f"🕐 পরবর্তী Post যাবে: <b>{next_run}</b>\n"
+        f"📢 Channel: <code>{CHANNEL_ID}</code>\n\n"
+        f"ℹ️ সব post শেষ হলে আবার #1 থেকে শুরু হবে।",
         parse_mode="HTML"
     )
 
