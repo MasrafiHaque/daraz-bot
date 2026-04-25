@@ -237,10 +237,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     is_forwarded = bool(
-        msg.forward_origin or
-        msg.forward_from or
-        msg.forward_from_chat or
-        msg.forward_sender_name
+        getattr(msg, "forward_origin", None) or
+        getattr(msg, "forward_from", None) or
+        getattr(msg, "forward_from_chat", None) or
+        getattr(msg, "forward_sender_name", None) or
+        getattr(msg, "forward_date", None)
     )
 
     if is_forwarded:
