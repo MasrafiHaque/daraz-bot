@@ -1,39 +1,25 @@
 import os
 import json
-import asyncio
 import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 
-# ─── Logging ───────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Config ────────────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CHANNEL_ID  = os.environ.get("CHANNEL_ID", "@your_channel")   # e.g. @mychannel or -100xxxxxxxx
-ADMIN_ID    = int(os.environ.get("ADMIN_ID", "0"))             # your Telegram user ID
-POSTS_FILE  = "posts.json"
-CONFIG_FILE = "config.json"
-TIMEZONE    = "Asia/Dhaka"
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@your_channel")
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
+POSTS_FILE = "posts.json"
+CFG_FILE   = "config.json"
+TIMEZONE   = "Asia/Dhaka"
 
-# ─── Conversation states ────────────────────────────────────
-(
-    WAIT_PHOTO, WAIT_PRODUCT_NAME, WAIT_PRICE,
-    WAIT_LINK, WAIT_CAPTION, WAIT_CONFIRM,
-    WAIT_INTERVAL, WAIT_DELETE_ID
-) = range(8)
-
-# ─── Helpers ───────────────────────────────────────────────
 def load_posts():
     if os.path.exists(POSTS_FILE):
         with open(POSTS_FILE, "r", encoding="utf-8") as f:
@@ -44,41 +30,27 @@ def save_posts(posts):
     with open(POSTS_FILE, "w", encoding="utf-8") as f:
         json.dump(posts, f, ensure_ascii=False, indent=2)
 
-def load_config():
+def load_cfg():
     default = {"interval_hours": 2, "active": True, "post_index": 0}
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
+    if os.path.exists(CFG_FILE):
+        with open(CFG_FILE, "r") as f:
             cfg = json.load(f)
             for k, v in default.items():
                 cfg.setdefault(k, v)
             return cfg
     return default
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
+def save_cfg(cfg):
+    with open(CFG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
 def is_admin(update: Update):
     return update.effective_user.id == ADMIN_ID
 
-def build_post_text(post):
-    lines = []
-    if post.get("product_name"):
-        lines.append(f"🛍️ *{post['product_name']}*")
-    if post.get("price"):
-        lines.append(f"💰 মূল্য: *{post['price']}*")
-    if post.get("caption"):
-        lines.append(f"\n{post['caption']}")
-    if post.get("link"):
-        lines.append(f"\n🔗 [এখনই কিনুন]({post['link']})")
-    lines.append("\n✅ Daraz Affiliate | দ্রুত অর্ডার করুন!")
-    return "\n".join(lines)
-
-# ─── Scheduler ─────────────────────────────────────────────
 scheduler = AsyncIOScheduler(timezone=pytz.timezone(TIMEZONE))
 
 async def send_next_post(app):
-    cfg   = load_config()
+    cfg   = load_cfg()
     posts = load_posts()
     if not posts or not cfg.get("active"):
         return
@@ -86,356 +58,254 @@ async def send_next_post(app):
     idx  = cfg["post_index"] % len(posts)
     post = posts[idx]
     cfg["post_index"] = (idx + 1) % len(posts)
-    save_config(cfg)
+    save_cfg(cfg)
 
-    text = build_post_text(post)
     try:
         if post.get("photo_id"):
             await app.bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=post["photo_id"],
-                caption=text,
-                parse_mode="Markdown"
+                caption=post.get("caption", ""),
+                parse_mode="HTML"
             )
         else:
             await app.bot.send_message(
                 chat_id=CHANNEL_ID,
-                text=text,
-                parse_mode="Markdown",
+                text=post.get("caption", ""),
+                parse_mode="HTML",
                 disable_web_page_preview=False
             )
-        logger.info(f"✅ Post sent: {post.get('product_name', idx)}")
+        logger.info(f"Post {idx+1} sent.")
     except Exception as e:
-        logger.error(f"❌ Send error: {e}")
+        logger.error(f"Send error: {e}")
 
-def restart_scheduler(app, interval_hours):
+def restart_scheduler(app, hours):
     scheduler.remove_all_jobs()
-    scheduler.add_job(
-        send_next_post,
-        "interval",
-        hours=interval_hours,
-        args=[app],
-        id="post_job",
-        next_run_time=None   # don't fire immediately on reschedule
-    )
+    scheduler.add_job(send_next_post, "interval", hours=hours, args=[app], id="post_job")
 
-# ─── /start ────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return await update.message.reply_text("⛔ আপনি admin নন।")
-
-    cfg   = load_config()
+    cfg   = load_cfg()
     posts = load_posts()
-    text  = (
-        f"👋 *Daraz Affiliate Bot*\n\n"
-        f"📦 মোট Post: *{len(posts)}*\n"
-        f"⏱️ Interval: *{cfg['interval_hours']} ঘন্টা*\n"
-        f"🔄 Status: *{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}*\n\n"
-        f"*কমান্ড সমূহ:*\n"
-        f"/addpost — নতুন post যোগ করুন\n"
-        f"/listposts — সব post দেখুন\n"
-        f"/deletepost — post মুছুন\n"
-        f"/setinterval — interval পরিবর্তন করুন\n"
-        f"/pause — bot pause করুন\n"
+    await update.message.reply_text(
+        f"👋 <b>Daraz Affiliate Bot</b>\n\n"
+        f"📦 মোট Post: <b>{len(posts)}</b>\n"
+        f"⏱️ Interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
+        f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"<b>📤 Post যোগ করতে:</b>\n"
+        f"ছবি পাঠান (caption সহ) অথবা শুধু text পাঠান।\n"
+        f"Bot preview দেখাবে → আপনি ✅ বা ❌ করবেন।\n\n"
+        f"<b>⚙️ কমান্ড:</b>\n"
+        f"/list — সব post দেখুন\n"
+        f"/delete — post মুছুন\n"
+        f"/interval 3 — interval সেট করুন\n"
+        f"/pause — bot বন্ধ করুন\n"
         f"/resume — bot চালু করুন\n"
-        f"/sendnow — এখনই একটি post পাঠান\n"
-        f"/status — bot এর অবস্থা দেখুন"
+        f"/sendnow — এখনই post পাঠান\n"
+        f"/status — bot এর অবস্থা",
+        parse_mode="HTML"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ─── /addpost conversation ──────────────────────────────────
-async def addpost_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    ctx.user_data.clear()
-    await update.message.reply_text(
-        "📸 *Product এর ছবি পাঠান।*\n_(ছবি না থাকলে /skip লিখুন)_",
-        parse_mode="Markdown"
-    )
-    return WAIT_PHOTO
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    msg = update.message
 
-async def got_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        ctx.user_data["photo_id"] = update.message.photo[-1].file_id
-    await update.message.reply_text("✏️ *Product এর নাম লিখুন:*", parse_mode="Markdown")
-    return WAIT_PRODUCT_NAME
+    if msg.photo:
+        photo_id = msg.photo[-1].file_id
+        caption  = msg.caption or ""
+        ctx.user_data["pending_caption"] = caption
 
-async def skip_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["photo_id"] = None
-    await update.message.reply_text("✏️ *Product এর নাম লিখুন:*", parse_mode="Markdown")
-    return WAIT_PRODUCT_NAME
-
-async def got_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["product_name"] = update.message.text.strip()
-    await update.message.reply_text("💰 *মূল্য লিখুন* (যেমন: ৳ ১,২৯৯):", parse_mode="Markdown")
-    return WAIT_PRICE
-
-async def got_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["price"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🔗 *Daraz Affiliate Link দিন:*\n_(না থাকলে /skip)_",
-        parse_mode="Markdown"
-    )
-    return WAIT_LINK
-
-async def got_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["link"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📝 *Extra caption/description লিখুন:*\n_(না থাকলে /skip)_",
-        parse_mode="Markdown"
-    )
-    return WAIT_CAPTION
-
-async def skip_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["link"] = ""
-    await update.message.reply_text(
-        "📝 *Extra caption/description লিখুন:*\n_(না থাকলে /skip)_",
-        parse_mode="Markdown"
-    )
-    return WAIT_CAPTION
-
-async def got_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["caption"] = update.message.text.strip()
-    return await show_preview(update, ctx)
-
-async def skip_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["caption"] = ""
-    return await show_preview(update, ctx)
-
-async def show_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    post = ctx.user_data
-    preview = build_post_text(post)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Save করুন", callback_data="confirm_save"),
-         InlineKeyboardButton("❌ বাদ দিন", callback_data="confirm_cancel")]
-    ])
-    if post.get("photo_id"):
-        await update.message.reply_photo(
-            photo=post["photo_id"], caption=f"*Preview:*\n\n{preview}",
-            parse_mode="Markdown", reply_markup=kb
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Schedule করুন", callback_data=f"save|photo|{photo_id}"),
+            InlineKeyboardButton("❌ বাদ দিন",       callback_data="cancel")
+        ]])
+        await msg.reply_photo(
+            photo=photo_id,
+            caption=f"<b>📋 Preview:</b>\n\n{caption or '(কোনো caption নেই)'}\n\n<i>Channel এ schedule করবেন?</i>",
+            parse_mode="HTML",
+            reply_markup=kb
         )
-    else:
-        await update.message.reply_text(
-            f"*Preview:*\n\n{preview}", parse_mode="Markdown", reply_markup=kb
-        )
-    return WAIT_CONFIRM
 
-async def confirm_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    elif msg.text and not msg.text.startswith("/"):
+        text = msg.text
+        ctx.user_data["pending_caption"] = text
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Schedule করুন", callback_data="save|text|none"),
+            InlineKeyboardButton("❌ বাদ দিন",       callback_data="cancel")
+        ]])
+        await msg.reply_text(
+            f"<b>📋 Preview:</b>\n\n{text}\n\n<i>Channel এ schedule করবেন?</i>",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+
+async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "confirm_save":
-        posts = load_posts()
+    data  = query.data
+
+    if data == "cancel":
+        ctx.user_data.clear()
+        try:
+            await query.edit_message_caption(caption="❌ বাতিল করা হয়েছে।")
+        except:
+            await query.edit_message_text("❌ বাতিল করা হয়েছে।")
+        return
+
+    if data.startswith("save|"):
+        _, post_type, photo_id = data.split("|", 2)
+        caption = ctx.user_data.get("pending_caption", "")
+        posts   = load_posts()
         new_post = {
-            "id": len(posts) + 1,
-            "photo_id":     ctx.user_data.get("photo_id"),
-            "product_name": ctx.user_data.get("product_name"),
-            "price":        ctx.user_data.get("price"),
-            "link":         ctx.user_data.get("link"),
-            "caption":      ctx.user_data.get("caption"),
-            "created_at":   datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+            "id":         len(posts) + 1,
+            "photo_id":   photo_id if post_type == "photo" else None,
+            "caption":    caption,
+            "created_at": datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
         }
         posts.append(new_post)
         save_posts(posts)
-        await query.edit_message_caption(
-            caption=f"✅ *Post #{new_post['id']} সংরক্ষিত হয়েছে!*\nমোট post: {len(posts)}",
-            parse_mode="Markdown"
-        ) if new_post["photo_id"] else await query.edit_message_text(
-            f"✅ *Post #{new_post['id']} সংরক্ষিত হয়েছে!*\nমোট post: {len(posts)}",
-            parse_mode="Markdown"
+        ctx.user_data.clear()
+
+        cfg = load_cfg()
+        msg = (
+            f"✅ <b>Post #{new_post['id']} সংরক্ষিত!</b>\n"
+            f"📦 মোট post: {len(posts)}\n"
+            f"⏱️ পরবর্তী post যাবে <b>{cfg['interval_hours']} ঘন্টা</b> পর।"
         )
-    else:
-        await query.edit_message_text("❌ বাতিল করা হয়েছে।")
-    ctx.user_data.clear()
-    return ConversationHandler.END
+        try:
+            await query.edit_message_caption(caption=msg, parse_mode="HTML")
+        except:
+            await query.edit_message_text(msg, parse_mode="HTML")
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    await update.message.reply_text("❌ বাতিল।")
-    return ConversationHandler.END
+    elif data.startswith("del|"):
+        del_id = int(data.split("|")[1])
+        posts  = [p for p in load_posts() if p["id"] != del_id]
+        for i, p in enumerate(posts, 1):
+            p["id"] = i
+        save_posts(posts)
+        cfg = load_cfg()
+        cfg["post_index"] = 0
+        save_cfg(cfg)
+        await query.edit_message_text(f"🗑️ Post #{del_id} মুছে ফেলা হয়েছে।")
 
-# ─── /listposts ─────────────────────────────────────────────
 async def list_posts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     posts = load_posts()
     if not posts:
-        return await update.message.reply_text("📭 কোনো post নেই।")
+        return await update.message.reply_text("📭 কোনো post নেই। ছবি বা text পাঠিয়ে post যোগ করুন।")
 
-    cfg = load_config()
-    current_idx = cfg["post_index"] % len(posts)
-    lines = ["📋 *সব Post:*\n"]
+    cfg     = load_cfg()
+    current = cfg["post_index"] % len(posts)
+    lines   = ["📋 <b>সব Post:</b>\n"]
     for i, p in enumerate(posts):
-        marker = "▶️" if i == current_idx else "  "
-        lines.append(
-            f"{marker} *#{p['id']}* — {p.get('product_name','—')} | {p.get('price','—')}\n"
-            f"    🕐 {p.get('created_at','')}"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        marker  = "▶️" if i == current else "  "
+        preview = (p.get("caption") or "")[:45].replace("\n", " ")
+        icon    = "🖼️" if p.get("photo_id") else "📝"
+        lines.append(f"{marker}{icon} <b>#{p['id']}</b> — {preview}…\n    🕐 {p.get('created_at','')}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-# ─── /deletepost ────────────────────────────────────────────
-async def delete_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def delete_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     posts = load_posts()
     if not posts:
         return await update.message.reply_text("📭 কোনো post নেই।")
-    lines = ["🗑️ *কোন post মুছবেন? ID লিখুন:*\n"]
+
+    buttons = []
     for p in posts:
-        lines.append(f"#{p['id']} — {p.get('product_name','—')}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    return WAIT_DELETE_ID
+        preview = (p.get("caption") or "")[:30].replace("\n", " ")
+        icon    = "🖼️" if p.get("photo_id") else "📝"
+        buttons.append([InlineKeyboardButton(
+            f"{icon} #{p['id']} — {preview}…",
+            callback_data=f"del|{p['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("❌ বাতিল", callback_data="cancel")])
+    await update.message.reply_text(
+        "🗑️ <b>কোন post মুছবেন?</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
-async def delete_by_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        del_id = int(update.message.text.strip().replace("#",""))
-    except ValueError:
-        await update.message.reply_text("❌ সঠিক ID দিন।")
-        return WAIT_DELETE_ID
-
-    posts = load_posts()
-    new_posts = [p for p in posts if p["id"] != del_id]
-    if len(new_posts) == len(posts):
-        await update.message.reply_text("❌ এই ID এর post পাওয়া যায়নি।")
-        return WAIT_DELETE_ID
-
-    # Re-index
-    for i, p in enumerate(new_posts, 1):
-        p["id"] = i
-    save_posts(new_posts)
-
-    cfg = load_config()
-    cfg["post_index"] = 0
-    save_config(cfg)
-
-    await update.message.reply_text(f"✅ Post #{del_id} মুছে ফেলা হয়েছে। মোট: {len(new_posts)}")
-    return ConversationHandler.END
-
-# ─── /setinterval ───────────────────────────────────────────
-async def set_interval_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    cfg = load_config()
-    await update.message.reply_text(
-        f"⏱️ *বর্তমান interval: {cfg['interval_hours']} ঘন্টা*\n\nনতুন interval (ঘন্টায়) লিখুন:\n_উদাহরণ: 1, 2, 3, 6, 12_",
-        parse_mode="Markdown"
-    )
-    return WAIT_INTERVAL
-
-async def got_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if not args:
+        cfg = load_cfg()
+        return await update.message.reply_text(
+            f"⏱️ বর্তমান interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n\n"
+            f"পরিবর্তন করতে: <code>/interval 3</code>",
+            parse_mode="HTML"
+        )
     try:
-        hours = float(update.message.text.strip())
-        if hours < 0.1:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ সঠিক সংখ্যা দিন (যেমন: 1, 2, 6)")
-        return WAIT_INTERVAL
+        hours = float(args[0])
+        if hours < 0.1: raise ValueError
+    except:
+        return await update.message.reply_text("❌ সঠিক সংখ্যা দিন। যেমন: /interval 3")
 
-    cfg = load_config()
+    cfg = load_cfg()
     cfg["interval_hours"] = hours
-    save_config(cfg)
-
+    save_cfg(cfg)
     restart_scheduler(ctx.application, hours)
-    await update.message.reply_text(
-        f"✅ Interval *{hours} ঘন্টা* সেট হয়েছে!\n_পরবর্তী post {hours} ঘন্টা পর যাবে।_",
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
+    await update.message.reply_text(f"✅ Interval <b>{hours} ঘন্টা</b> সেট হয়েছে!", parse_mode="HTML")
 
-# ─── /pause /resume ─────────────────────────────────────────
 async def pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    cfg = load_config()
-    cfg["active"] = False
-    save_config(cfg)
-    await update.message.reply_text("⏸️ Bot pause করা হয়েছে। Post যাবে না।")
+    cfg = load_cfg(); cfg["active"] = False; save_cfg(cfg)
+    await update.message.reply_text("⏸️ Bot pause — আর post যাবে না।")
 
 async def resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    cfg = load_config()
-    cfg["active"] = True
-    save_config(cfg)
-    await update.message.reply_text("▶️ Bot চালু হয়েছে! Posts যেতে থাকবে।")
+    cfg = load_cfg(); cfg["active"] = True; save_cfg(cfg)
+    await update.message.reply_text("▶️ Bot চালু — post যেতে থাকবে।")
 
-# ─── /sendnow ───────────────────────────────────────────────
 async def send_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    await update.message.reply_text("📤 এখনই পাঠানো হচ্ছে...")
+    if not load_posts():
+        return await update.message.reply_text("📭 কোনো post নেই।")
+    await update.message.reply_text("📤 পাঠানো হচ্ছে...")
     await send_next_post(ctx.application)
-    await update.message.reply_text("✅ Post পাঠানো হয়েছে!")
+    await update.message.reply_text("✅ Post channel এ গেছে!")
 
-# ─── /status ────────────────────────────────────────────────
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    cfg   = load_config()
+    cfg   = load_cfg()
     posts = load_posts()
     jobs  = scheduler.get_jobs()
     next_run = "N/A"
-    if jobs:
-        nrt = jobs[0].next_run_time
-        if nrt:
-            next_run = nrt.strftime("%d %b %Y, %I:%M %p")
-
+    if jobs and jobs[0].next_run_time:
+        next_run = jobs[0].next_run_time.strftime("%d %b, %I:%M %p")
     await update.message.reply_text(
-        f"📊 *Bot Status*\n\n"
-        f"📦 মোট Post: *{len(posts)}*\n"
-        f"⏱️ Interval: *{cfg['interval_hours']} ঘন্টা*\n"
-        f"🔄 Status: *{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}*\n"
-        f"🕐 পরবর্তী Post: *{next_run}*\n"
-        f"📢 Channel: `{CHANNEL_ID}`",
-        parse_mode="Markdown"
+        f"📊 <b>Bot Status</b>\n\n"
+        f"📦 মোট Post: <b>{len(posts)}</b>\n"
+        f"⏱️ Interval: <b>{cfg['interval_hours']} ঘন্টা</b>\n"
+        f"🔄 Status: <b>{'✅ চালু' if cfg['active'] else '⏸️ বন্ধ'}</b>\n"
+        f"🕐 পরবর্তী Post: <b>{next_run}</b>\n"
+        f"📢 Channel: <code>{CHANNEL_ID}</code>",
+        parse_mode="HTML"
     )
 
-# ─── Main ──────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # Add post conversation
-    add_conv = ConversationHandler(
-        entry_points=[CommandHandler("addpost", addpost_start)],
-        states={
-            WAIT_PHOTO:        [MessageHandler(filters.PHOTO, got_photo),
-                                CommandHandler("skip", skip_photo)],
-            WAIT_PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
-            WAIT_PRICE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, got_price)],
-            WAIT_LINK:         [MessageHandler(filters.TEXT & ~filters.COMMAND, got_link),
-                                CommandHandler("skip", skip_link)],
-            WAIT_CAPTION:      [MessageHandler(filters.TEXT & ~filters.COMMAND, got_caption),
-                                CommandHandler("skip", skip_caption)],
-            WAIT_CONFIRM:      [CallbackQueryHandler(confirm_handler, pattern="^confirm_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Delete post conversation
-    del_conv = ConversationHandler(
-        entry_points=[CommandHandler("deletepost", delete_start)],
-        states={
-            WAIT_DELETE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_by_id)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Interval conversation
-    interval_conv = ConversationHandler(
-        entry_points=[CommandHandler("setinterval", set_interval_start)],
-        states={
-            WAIT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_interval)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("listposts", list_posts))
-    app.add_handler(CommandHandler("pause",  pause))
-    app.add_handler(CommandHandler("resume", resume))
-    app.add_handler(CommandHandler("sendnow", send_now))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(add_conv)
-    app.add_handler(del_conv)
-    app.add_handler(interval_conv)
-
-    # Start scheduler
-    cfg = load_config()
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("list",     list_posts))
+    app.add_handler(CommandHandler("delete",   delete_post))
+    app.add_handler(CommandHandler("interval", set_interval))
+    app.add_handler(CommandHandler("pause",    pause))
+    app.add_handler(CommandHandler("resume",   resume))
+    app.add_handler(CommandHandler("sendnow",  send_now))
+    app.add_handler(CommandHandler("status",   status))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(
+        (filters.TEXT & ~filters.COMMAND) | filters.PHOTO,
+        handle_message
+    ))
+    cfg = load_cfg()
     restart_scheduler(app, cfg["interval_hours"])
     scheduler.start()
-    logger.info(f"✅ Bot started | Interval: {cfg['interval_hours']}h | Channel: {CHANNEL_ID}")
-
+    logger.info(f"Bot started | {cfg['interval_hours']}h | {CHANNEL_ID}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
