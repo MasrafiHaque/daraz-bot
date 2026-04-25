@@ -54,12 +54,10 @@ async def send_next_post(app):
     posts = load_posts()
     if not posts or not cfg.get("active"):
         return
-
     idx  = cfg["post_index"] % len(posts)
     post = posts[idx]
     cfg["post_index"] = (idx + 1) % len(posts)
     save_cfg(cfg)
-
     try:
         if post.get("photo_id"):
             await app.bot.send_photo(
@@ -96,7 +94,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━\n"
         f"<b>📤 Post যোগ করতে:</b>\n"
         f"ছবি পাঠান (caption সহ) অথবা শুধু text পাঠান।\n"
-        f"Bot preview দেখাবে → আপনি ✅ বা ❌ করবেন।\n\n"
+        f"Bot preview দেখাবে → ✅ বা ❌ চাপুন।\n\n"
         f"<b>⚙️ কমান্ড:</b>\n"
         f"/list — সব post দেখুন\n"
         f"/delete — post মুছুন\n"
@@ -108,6 +106,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+# ── Message Handler ─────────────────────────────────────────
+# Bug fix: photo_id কে callback_data তে রাখা যায় না (64 byte limit)
+# তাই pending post টা context.bot_data তে রাখছি
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -116,25 +118,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg.photo:
         photo_id = msg.photo[-1].file_id
         caption  = msg.caption or ""
-        ctx.user_data["pending_caption"] = caption
+
+        # pending post সংরক্ষণ করি bot_data তে
+        ctx.bot_data["pending"] = {"photo_id": photo_id, "caption": caption}
 
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Schedule করুন", callback_data=f"save|photo|{photo_id}"),
+            InlineKeyboardButton("✅ Schedule করুন", callback_data="save"),
             InlineKeyboardButton("❌ বাদ দিন",       callback_data="cancel")
         ]])
         await msg.reply_photo(
             photo=photo_id,
-            caption=f"<b>📋 Preview:</b>\n\n{caption or '(কোনো caption নেই)'}\n\n<i>Channel এ schedule করবেন?</i>",
+            caption=f"<b>📋 Preview:</b>\n\n{caption or '(caption নেই)'}\n\n<i>Channel এ schedule করবেন?</i>",
             parse_mode="HTML",
             reply_markup=kb
         )
 
     elif msg.text and not msg.text.startswith("/"):
         text = msg.text
-        ctx.user_data["pending_caption"] = text
+        ctx.bot_data["pending"] = {"photo_id": None, "caption": text}
 
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Schedule করুন", callback_data="save|text|none"),
+            InlineKeyboardButton("✅ Schedule করুন", callback_data="save"),
             InlineKeyboardButton("❌ বাদ দিন",       callback_data="cancel")
         ]])
         await msg.reply_text(
@@ -143,32 +147,35 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb
         )
 
+# ── Callback Handler ────────────────────────────────────────
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data  = query.data
 
     if data == "cancel":
-        ctx.user_data.clear()
+        ctx.bot_data.pop("pending", None)
         try:
             await query.edit_message_caption(caption="❌ বাতিল করা হয়েছে।")
         except:
             await query.edit_message_text("❌ বাতিল করা হয়েছে।")
         return
 
-    if data.startswith("save|"):
-        _, post_type, photo_id = data.split("|", 2)
-        caption = ctx.user_data.get("pending_caption", "")
-        posts   = load_posts()
+    if data == "save":
+        pending = ctx.bot_data.pop("pending", None)
+        if not pending:
+            await query.edit_message_text("❌ কিছু একটা সমস্যা হয়েছে, আবার পাঠান।")
+            return
+
+        posts    = load_posts()
         new_post = {
             "id":         len(posts) + 1,
-            "photo_id":   photo_id if post_type == "photo" else None,
-            "caption":    caption,
+            "photo_id":   pending["photo_id"],
+            "caption":    pending["caption"],
             "created_at": datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
         }
         posts.append(new_post)
         save_posts(posts)
-        ctx.user_data.clear()
 
         cfg = load_cfg()
         msg = (
