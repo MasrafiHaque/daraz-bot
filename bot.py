@@ -231,12 +231,69 @@ async def send_next_post(app, force=False):
             logger.error(f"⚠️ Post #{post['id']} skipped after {MAX_RETRY} attempts.")
         return sent
 
+_alerted_empty    = False   # একবারই alert পাঠাবে, বারবার না
+_alerted_overdue  = False   # অনেকক্ষণ delay হলে একবার alert
+
 async def watchdog(app):
+    global _alerted_empty, _alerted_overdue
+
     cfg   = load_cfg()
     posts = load_posts()
-    if not cfg.get("active") or not posts: return
-    if secs_since_last(cfg) >= cfg["interval_hours"] * 3600:
-        logger.info("⏰ Watchdog triggered — sending post...")
+
+    # ── posts নেই → admin কে জানাও (একবার) ─────────────────────
+    if not posts:
+        if not _alerted_empty:
+            _alerted_empty = True
+            logger.warning("⚠️ Watchdog: posts.json empty!")
+            try:
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "⚠️ <b>Bot Alert</b>\n\n"
+                        "📭 কোনো post নেই! Bot posting বন্ধ আছে।\n\n"
+                        "🔴 কারণ হতে পারে:\n"
+                        "• Railway restart হয়েছে এবং Volume নেই\n"
+                        "• সব post মুছে ফেলা হয়েছে\n\n"
+                        "👉 /start দিয়ে নতুন post যোগ করুন।"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Alert send failed: {e}")
+        return
+
+    # posts আসলে alert reset করো
+    _alerted_empty = False
+
+    if not cfg.get("active"):
+        return
+
+    elapsed = secs_since_last(cfg)
+    interval_sec = cfg["interval_hours"] * 3600
+
+    # ── অনেক বেশি দেরি হলে (interval × 3 পেরিয়ে গেলে) admin কে সতর্ক করো ──
+    if elapsed >= interval_sec * 3 and not _alerted_overdue:
+        _alerted_overdue = True
+        overdue_h = elapsed / 3600
+        logger.warning(f"⚠️ Post overdue by {overdue_h:.1f}h!")
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "⚠️ <b>Post Overdue Alert</b>\n\n"
+                    f"⏰ শেষ post {overdue_h:.1f} ঘন্টা আগে হয়েছিল!\n"
+                    f"Expected interval: {cfg['interval_hours']} ঘন্টা\n\n"
+                    "Bot এখনই পাঠানোর চেষ্টা করছে..."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Overdue alert failed: {e}")
+
+    # ── সময় হয়েছে → post পাঠাও ─────────────────────────────────
+    if elapsed >= interval_sec:
+        _alerted_overdue = False   # পাঠানোর পর reset
+        logger.info(f"⏰ Watchdog: {elapsed/3600:.1f}h elapsed — sending post...")
         await send_next_post(app)
 
 # ═══════════════════════════ main menu ══════════════════════════
@@ -618,6 +675,26 @@ def main():
     logger.info(f"🚀 Bot started | DATA_DIR={DATA_DIR} | interval={cfg['interval_hours']}h")
     logger.info(f"   last_posted_at = {cfg.get('last_posted_at') or 'never'}")
 
+    async def on_startup(app):
+        posts = load_posts()
+        cfg2  = load_cfg()
+        last  = cfg2.get("last_posted_at") or "\u0995\u0996\u09a8\u09cb \u09b9\u09af\u09bc\u09a8\u09bf"
+        if not posts:
+            msg = "\U0001f534 <b>Bot \u099a\u09be\u09b2\u09c1 \u09b9\u09af\u09bc\u09c7\u099b\u09c7 \u2014 \u0995\u09bf\u09a8\u09cd\u09a4\u09c1 \u0995\u09cb\u09a8\u09cb post \u09a8\u09c7\u0987!</b>\n\nRailway restart \u098f\u09b0 \u0995\u09be\u09b0\u09a3\u09c7 data \u09ae\u09c1\u099b\u09c7 \u09af\u09c7\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u0964\n\U0001f449 /start \u09a6\u09bf\u09af\u09bc\u09c7 post \u09af\u09cb\u0997 \u0995\u09b0\u09c1\u09a8\u0964"
+        else:
+            msg = (
+                "\U0001f7e2 <b>Bot \u099a\u09be\u09b2\u09c1 \u09b9\u09af\u09bc\u09c7\u099b\u09c7!</b>\n\n"
+                f"\U0001f4e6 Post: <b>{len(posts)}</b>\n"
+                f"\u23f1\ufe0f Interval: <b>{cfg2['interval_hours']} \u0998\u09a8\u09cd\u099f\u09be</b>\n"
+                f"\U0001f550 \u09aa\u09b0\u09ac\u09b0\u09cd\u09a4\u09c0 post: <b>{next_post_in(cfg2)}</b>\n"
+                f"\U0001f4c5 \u09b6\u09c7\u09b7 post: <b>{last}</b>"
+            )
+        try:
+            await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Startup alert failed: {e}")
+
+    app.post_init = on_startup
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
